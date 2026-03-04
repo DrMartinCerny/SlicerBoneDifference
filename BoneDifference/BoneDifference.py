@@ -31,7 +31,7 @@ class BoneDifference(ScriptedLoadableModule):
 Detect bone defects by subtracting preoperative and postoperative CT scans
 and binarizing the positive bone-loss signal inside skull bone.
 
-Optionally runs BRAINSFit affine registration (postop → preop) and uses the transformed postop
+Optionally runs BRAINSFit registration (postop → preop) and uses the transformed postop
 for the diff computation.
 """
         parent.acknowledgementText = ""
@@ -62,7 +62,7 @@ class BoneDifferenceWidget(ScriptedLoadableModuleWidget):
         form.addRow("Postop volume:", self.postopSelector)
 
         # --- Registration section ---
-        self.registerCheckbox = qt.QCheckBox("Run affine registration (postop → preop) using BRAINSFit")
+        self.registerCheckbox = qt.QCheckBox("Run registration (postop → preop) using BRAINSFit")
         self.registerCheckbox.checked = False
         form.addRow("", self.registerCheckbox)
 
@@ -73,6 +73,29 @@ class BoneDifferenceWidget(ScriptedLoadableModuleWidget):
         self.transformedSelector.renameEnabled = True
         self.transformedSelector.setMRMLScene(slicer.mrmlScene)
         form.addRow("Transformed postop output:", self.transformedSelector)
+
+        self.transformTypeCombo = qt.QComboBox()
+        self.transformTypeCombo.addItems(["Rigid", "Rigid+Affine"])
+        self.transformTypeCombo.currentText = "Rigid+Affine"  # default
+        form.addRow("Transform type:", self.transformTypeCombo)
+
+        self.initModeCombo = qt.QComboBox()
+        self.initModeCombo.addItems([
+            "useGeometryAlign",
+            "useCenterOfHeadAlign",
+            "useCenterOfROIAlign",
+            "useMomentsAlign",
+            "useNone",
+        ])
+        self.initModeCombo.currentText = "useGeometryAlign"
+        form.addRow("Initialization:", self.initModeCombo)
+
+        self.iterationsSpin = qt.QSpinBox()
+        self.iterationsSpin.minimum = 1
+        self.iterationsSpin.maximum = 1_000_000
+        self.iterationsSpin.singleStep = 100
+        self.iterationsSpin.value = 1500
+        form.addRow("Iterations:", self.iterationsSpin)
 
         # Outputs
         self.diffOutputSelector = slicer.qMRMLNodeComboBox()
@@ -146,7 +169,11 @@ class BoneDifferenceWidget(ScriptedLoadableModuleWidget):
         self._onRegisterToggled(self.registerCheckbox.checked)
 
     def _onRegisterToggled(self, checked: bool):
-        self.transformedSelector.enabled = bool(checked)
+        checked = bool(checked)
+        self.transformedSelector.enabled = checked
+        self.transformTypeCombo.enabled = checked
+        self.initModeCombo.enabled = checked
+        self.iterationsSpin.enabled = checked
 
     def onRun(self):
         preop = self.preopSelector.currentNode()
@@ -176,9 +203,20 @@ class BoneDifferenceWidget(ScriptedLoadableModuleWidget):
             maskNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "Mask")
             self.maskOutputSelector.setCurrentNode(maskNode)
 
+        reg_transform_type = self.transformTypeCombo.currentText
+        reg_init_mode = self.initModeCombo.currentText
+        reg_iterations = int(self.iterationsSpin.value)
+
         params = dict(
             do_registration=doRegister,
             transformed_postop_node=transformedNode,
+
+            # registration params
+            registration_transform_type=str(reg_transform_type),
+            registration_initialize_transform_mode=str(reg_init_mode),
+            registration_number_of_iterations=int(reg_iterations),
+
+            # binarization params
             delta_hu_threshold=float(self.deltaThresholdSpin.value),
             bone_threshold_hu=float(self.boneThresholdSpin.value),
             min_component_size=int(self.minCompSpin.value),
@@ -262,14 +300,8 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
                 f"'{aName}' vs '{bName}'"
             )
 
-    # ---- Direction helper used by your binarize.py ----------------------------
-
     @staticmethod
     def _direction_3x3_from_ijk_to_ras_matrix(volumeNode) -> np.ndarray:
-        """
-        Build a 3x3 direction matrix whose columns are unit direction vectors
-        for I, J, K axes in RAS space (normalize columns to remove spacing scale).
-        """
         m = vtk.vtkMatrix4x4()
         volumeNode.GetIJKToRASMatrix(m)
 
@@ -280,8 +312,6 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
                 D[:, c] /= n
         return D
 
-    # ---- Main pipeline ---------------------------------------------------------
-
     def run(
         self,
         preopNode,
@@ -291,6 +321,12 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
         *,
         do_registration: bool = False,
         transformed_postop_node=None,
+
+        registration_transform_type: str = "Rigid+Affine",
+        registration_initialize_transform_mode: str = "useGeometryAlign",
+        registration_number_of_iterations: int = 1500,
+
+        # binarization params
         delta_hu_threshold: float = 700.0,
         bone_threshold_hu: float = 300.0,
         min_component_size: int = 50,
@@ -308,11 +344,19 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
             if transformed_postop_node is None:
                 raise ValueError("do_registration=True but transformed_postop_node is None")
 
-            logging.info("Running BRAINSFit affine registration (postop -> preop)")
+            logging.info(
+                f"Running BRAINSFit registration (postop -> preop) "
+                f"type={registration_transform_type}, init={registration_initialize_transform_mode}, "
+                f"iters={registration_number_of_iterations}"
+            )
+
             cliNode = register.register_postop_to_preop_affine(
                 fixed_preop_node=preopNode,
                 moving_postop_node=postopNode,
                 output_transformed_postop_node=transformed_postop_node,
+                transform_type=str(registration_transform_type),
+                initialize_transform_mode=str(registration_initialize_transform_mode),
+                number_of_iterations=int(registration_number_of_iterations),
             )
 
             # Force geometry to match preop (per your earlier requirement)
@@ -320,7 +364,6 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
             transformed_postop_node.SetSpacing(preopNode.GetSpacing())
             transformed_postop_node.SetOrigin(preopNode.GetOrigin())
 
-            # Now enforce strict identity of geometry (this should pass)
             self._assert_same_geometry(
                 preopNode,
                 transformed_postop_node,
@@ -339,7 +382,6 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
             subtractNode = transformed_postop_node
 
         else:
-            # No registration: require that preop and postop already match perfectly
             self._assert_same_geometry(
                 preopNode,
                 postopNode,
@@ -348,14 +390,11 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
             )
             subtractNode = postopNode
 
-        # ------------------------------------------------------------------
-        # Diff (preop - subtractNode)
-        # ------------------------------------------------------------------
-        preop = slicer.util.arrayFromVolume(preopNode).astype(np.float32)           # (z,y,x)
-        sub = slicer.util.arrayFromVolume(subtractNode).astype(np.float32)         # (z,y,x)
+        # Diff
+        preop = slicer.util.arrayFromVolume(preopNode).astype(np.float32)
+        sub = slicer.util.arrayFromVolume(subtractNode).astype(np.float32)
 
         if preop.shape != sub.shape:
-            # Should never happen if geometry checks passed, but keep it explicit.
             raise ValueError(f"Array shape mismatch: preop {preop.shape} vs subtract {sub.shape}")
 
         diff = preop - sub
@@ -370,10 +409,8 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
         if diffDisplay:
             diffDisplay.AutoWindowLevelOn()
 
-        # ------------------------------------------------------------------
-        # Binarize mask using numpy/scipy pipeline
-        # ------------------------------------------------------------------
-        spacing_xyz = preopNode.GetSpacing()  # (sx, sy, sz)
+        # Binarize
+        spacing_xyz = preopNode.GetSpacing()
         direction_3x3 = self._direction_3x3_from_ijk_to_ras_matrix(preopNode)
 
         mask = binarize.binarize_diff(
@@ -390,7 +427,6 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
             connectivity=1,
         )
 
-        # --- Save mask output (labelmap 0/1) ---
         slicer.util.updateVolumeFromArray(maskNode, mask.astype(np.uint8, copy=False))
         maskNode.CopyOrientation(preopNode)
         maskNode.SetSpacing(preopNode.GetSpacing())

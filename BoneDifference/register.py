@@ -9,46 +9,57 @@ def register_postop_to_preop_affine(
     output_transformed_postop_node,
     sampling_percentage: float = 0.2,
     initialize_transform_mode: str = "useGeometryAlign",
+    transform_type: str = "Rigid+Affine",   # "Rigid" or "Rigid+Affine"
+    number_of_iterations: int = 1500,
 ):
     """
-    Run BRAINSFit affine registration with:
+    Run BRAINSFit registration with:
       fixed  = preop
       moving = postop
     Produces output volume in fixed (preop) space.
 
-    Notes:
-    - This returns the CLI node (can be used to inspect status/params).
-    - output_transformed_postop_node will be filled by BRAINSFit.
+    Parameters
+    ----------
+    transform_type:
+        "Rigid" or "Rigid+Affine" (default).
+    initialize_transform_mode:
+        BRAINSFit initializeTransformMode string (e.g., useGeometryAlign, useCenterOfHeadAlign, ...).
+    number_of_iterations:
+        BRAINSFit numberOfIterations (default 1500).
     """
     if fixed_preop_node is None or moving_postop_node is None:
         raise ValueError("fixed_preop_node and moving_postop_node must be set")
     if output_transformed_postop_node is None:
         raise ValueError("output_transformed_postop_node must be set")
 
-    # Ensure BRAINSFit is available
     if not hasattr(slicer.modules, "brainsfit"):
-        raise RuntimeError("BRAINSFit module not found in this Slicer installation (slicer.modules.brainsfit missing).")
+        raise RuntimeError(
+            "BRAINSFit module not found in this Slicer installation (slicer.modules.brainsfit missing)."
+        )
 
-    # BRAINSFit parameters (CLI)
+    tt = (transform_type or "").strip()
+    if tt not in ("Rigid", "Rigid+Affine"):
+        raise ValueError(f"transform_type must be 'Rigid' or 'Rigid+Affine', got: {transform_type!r}")
+
+    useRigid = True
+    useAffine = (tt == "Rigid+Affine")
+
     params = {
         "fixedVolume": fixed_preop_node.GetID(),
         "movingVolume": moving_postop_node.GetID(),
         "outputVolume": output_transformed_postop_node.GetID(),
 
-        # Rigid + Affine (affine includes rigid stage typically; we enable both explicitly)
-        "useRigid": True,
-        "useAffine": True,
+        "useRigid": bool(useRigid),
+        "useAffine": bool(useAffine),
 
-        # Initialization (important when headers are unreliable)
-        "initializeTransformMode": initialize_transform_mode,
+        "initializeTransformMode": str(initialize_transform_mode),
 
-        # Speed/robustness knobs
         "samplingPercentage": float(sampling_percentage),
+        "numberOfIterations": int(number_of_iterations),
     }
 
     logging.info(f"Running BRAINSFit with params: {params}")
 
-    # Run synchronously (wait_for_completion=True)
     cliNode = slicer.cli.run(
         slicer.modules.brainsfit,
         None,
@@ -58,7 +69,6 @@ def register_postop_to_preop_affine(
 
     status = cliNode.GetStatusString() if cliNode else "Unknown"
     if cliNode and cliNode.GetStatus() != cliNode.Completed:
-        # Try to surface useful error text
         err = cliNode.GetErrorText() if hasattr(cliNode, "GetErrorText") else ""
         raise RuntimeError(f"BRAINSFit failed (status={status}). {err}")
 
