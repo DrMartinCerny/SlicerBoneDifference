@@ -1,0 +1,45 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Build artifacts (Slicer)
+# =========================
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# =========================
+# Temporary files
+# =========================
+*.log
+*.tmp
+*.swp
+
+# =========================
+# macOS
+# =========================
+.DS_Store
+
+# =========================
+# IDEs
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Python environments
+# =========================
+.env
+.venv
+venv/
+
+# =========================
+# Slicer testing artifacts
+# =========================
+Testing/
