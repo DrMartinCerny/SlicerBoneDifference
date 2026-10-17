@@ -301,6 +301,10 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
             )
 
     @staticmethod
+    def _ijk_to_ras_numpy(volumeNode) -> np.ndarray:
+        return BoneDifferenceLogic._mat4_to_numpy(BoneDifferenceLogic._vtkmat4(volumeNode))
+
+    @staticmethod
     def _direction_3x3_from_ijk_to_ras_matrix(volumeNode) -> np.ndarray:
         m = vtk.vtkMatrix4x4()
         volumeNode.GetIJKToRASMatrix(m)
@@ -399,6 +403,16 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
 
         diff = preop - sub
 
+        # [v2] Voxels outside the postop field of view carry register.SENTINEL. They must not look like
+        # "removed bone" (v1 filled them with 0 HU, so any preop bone there produced a huge difference).
+        if do_registration:
+            valid = sub > (register.SENTINEL + 1.0)
+            n_invalid = int((~valid).sum())
+            if n_invalid:
+                diff[~valid] = 0.0
+            logging.info(f"[v2] postop field of view covers {100.0 * valid.mean():.1f} % of the preop grid")
+            del valid
+
         # --- Save diff output ---
         slicer.util.updateVolumeFromArray(diffNode, diff)
         diffNode.CopyOrientation(preopNode)
@@ -413,13 +427,26 @@ class BoneDifferenceLogic(ScriptedLoadableModuleLogic):
         spacing_xyz = preopNode.GetSpacing()
         direction_3x3 = self._direction_3x3_from_ijk_to_ras_matrix(preopNode)
 
+        # [v2] Head cap measured from the highest skull slice, not from the top end of the image.
+        # The cap is applied here; binarize_diff gets an effectively unlimited depth (clamped to the volume).
+        cap = register.head_top_cap_mask(
+            preop,
+            self._ijk_to_ras_numpy(preopNode),
+            spacing_xyz,
+            float(head_cap_depth_mm),
+            bone_hu=float(bone_threshold_hu),
+            keep_largest=bool(keep_largest_bone_component),
+        )
+        diff_for_mask = np.where(cap, diff, 0.0).astype(np.float32)
+        del cap
+
         mask = binarize.binarize_diff(
-            diff,
+            diff_for_mask,
             preop,
             delta_hu_threshold=float(delta_hu_threshold),
             bone_threshold_hu=float(bone_threshold_hu),
             min_component_size=int(min_component_size),
-            head_cap_depth_mm=float(head_cap_depth_mm),
+            head_cap_depth_mm=1.0e6,  # cap already applied above
             keep_largest_bone_component=bool(keep_largest_bone_component),
             closing_radius_xyz=(1, 1, 1),
             spacing_xyz=spacing_xyz,
